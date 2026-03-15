@@ -9,7 +9,8 @@ import (
 
 // Config holds application configuration
 type Config struct {
-	DB db.DatabaseConfig
+	DB     db.DatabaseConfig
+	UseFTS bool // Enable FTS5 full-text search for people/groups
 }
 
 // Load reads configuration from .env file
@@ -44,6 +45,8 @@ func Load() (*Config, error) {
 				cfg.DB.PASSWORD = val
 			case "DB":
 				cfg.DB.DB = val
+			case "USE_FTS":
+				cfg.UseFTS = strings.ToLower(val) == "true" || val == "1"
 			}
 		}
 	}

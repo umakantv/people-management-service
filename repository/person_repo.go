@@ -85,7 +85,7 @@ func (r *PersonRepository) Update(id int, req models.UpdatePersonRequest) (*mode
 	return r.GetByID(id)
 }
 
-// Search finds people by substring match on name or email
+// Search finds people by substring match on name or email (LIKE fallback)
 func (r *PersonRepository) Search(query string) ([]models.Person, error) {
 	var people []models.Person
 	searchPattern := "%" + strings.ToLower(query) + "%"
@@ -100,6 +100,39 @@ func (r *PersonRepository) Search(query string) ([]models.Person, error) {
 		return nil, err
 	}
 	return people, nil
+}
+
+// SearchFTS searches people using FTS5 for faster, more accurate results
+// Returns ranked results with exact matches prioritized
+func (r *PersonRepository) SearchFTS(query string) ([]models.Person, error) {
+	var people []models.Person
+	// Use FTS5 MATCH with ranking (bm25) - lower score is better match
+	// Prioritize name matches over email by using column weights implicitly
+	sqlQuery := `
+		SELECT p.id, p.name, p.email, p.is_active, p.joined_date, p.deactived_at, p.activated_at
+		FROM people p
+		JOIN people_fts ON p.id = people_fts.rowid
+		WHERE people_fts MATCH ?
+		ORDER BY bm25(people_fts, 1.0, 0.5)
+		LIMIT 50
+	`
+	err := r.db.Select(&people, sqlQuery, query)
+	if err != nil {
+		return nil, err
+	}
+	return people, nil
+}
+
+// SearchWithFallback tries FTS search first, falls back to LIKE if FTS unavailable
+func (r *PersonRepository) SearchWithFallback(query string, useFTS bool) ([]models.Person, error) {
+	if useFTS {
+		people, err := r.SearchFTS(query)
+		if err == nil && len(people) > 0 {
+			return people, nil
+		}
+		// FTS failed or no results, fallback to LIKE
+	}
+	return r.Search(query)
 }
 
 // Deactivate sets is_active=0 and deactived_at=now

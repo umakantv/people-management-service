@@ -42,6 +42,38 @@ DB=people.db        # File path for SQLite, db name for others
 # PORT=3306
 # USER=root
 # PASSWORD=
+
+# FTS5 Full-Text Search (optional, default: false)
+USE_FTS=true        # Enable FTS5-powered search for /search endpoint
+```
+
+### Running with FTS5 Search
+
+The search feature (`GET /search?q=`) supports SQLite's FTS5 extension for faster, more accurate full-text search. However, FTS5 requires a special build tag when compiling the go-sqlite3 driver.
+
+**To run with FTS5 enabled:**
+
+```bash
+go run --tags "fts5" main.go
+```
+
+**Why the `--tags "fts5"` flag?**
+
+- The `github.com/mattn/go-sqlite3` driver has FTS5 support disabled by default to reduce binary size
+- FTS5 is an optional SQLite extension that must be compiled in via the `fts5` CGO build tag
+- Without this tag, SQLite reports: `no such module: fts5`
+
+**What happens if FTS5 is unavailable?**
+
+- The `/search` endpoint automatically falls back to standard LIKE queries
+- Functionality remains identical, just slower for large datasets
+- Set `USE_FTS=false` (or omit it) in `.env` to skip FTS5 entirely
+- The FTS5 migration (`20260315072311_add_fts5_search_tables.sql`) will still run but its virtual tables won't be used
+
+**To build a production binary with FTS5:**
+
+```bash
+go build --tags "fts5" -o people-service main.go
 ```
 
 ### Database Migrations
@@ -176,14 +208,19 @@ Sets `is_active=1` and `activated_at=now()`. Returns updated person (200 OK).
 ├── go.mod          # Go module definition
 ├── go.sum          # Dependency checksums
 ├── handlers/       # HTTP request handlers
-│   └── person.go   # Person API handlers
+│   ├── person.go   # Person API handlers
+│   └── group.go    # Group API handlers (including subgroups)
 ├── main.go         # Application entry point
 ├── migrations/     # Database migration files
 │   └── *.sql
 ├── models/         # Data models
-│   └── person.go   # Person entity and request types
+│   ├── person.go   # Person entity and request types
+│   └── group.go    # Group entity and request types
 ├── repository/     # Database access layer
-│   └── person_repo.go  # Person CRUD operations
+│   ├── person_repo.go  # Person CRUD operations
+│   └── group_repo.go   # Group CRUD operations (including subgroups)
+├── docs/
+│   └── apis.md     # API documentation
 └── README.md       # This file
 ```
 
@@ -192,5 +229,5 @@ Sets `is_active=1` and `activated_at=now()`. Returns updated person (200 OK).
 This service will expand to include:
 
 - **People**: CRUD operations for individuals ✓ (current)
-- **Groups**: CRUD operations for groups
-- **Membership**: Manage people-to-group relationships
+- **Groups**: CRUD operations for groups ✓ (includes subgroups, memberships, admin permissions)
+- **Membership**: Manage people-to-group relationships ✓ (integrated into groups)

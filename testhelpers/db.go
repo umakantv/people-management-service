@@ -58,12 +58,18 @@ func SetupTestDB(t *testing.T) *sqlx.DB {
 			person_id INTEGER NOT NULL,
 			group_id INTEGER NOT NULL,
 			added_by INTEGER NULL,
+			added_at DATETIME NULL,
+			removed_at DATETIME NULL,
+			removed_by INTEGER NULL,
 			PRIMARY KEY (person_id, group_id),
 			FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE CASCADE,
 			FOREIGN KEY (group_id) REFERENCES groups(id) ON DELETE CASCADE
 		);
 		CREATE INDEX IF NOT EXISTS idx_pgm_person ON person_group_memberships(person_id);
 		CREATE INDEX IF NOT EXISTS idx_pgm_group ON person_group_memberships(group_id);
+		CREATE INDEX IF NOT EXISTS idx_pgm_added_at ON person_group_memberships(added_at);
+		CREATE INDEX IF NOT EXISTS idx_pgm_removed_at ON person_group_memberships(removed_at);
+		CREATE INDEX IF NOT EXISTS idx_pgm_removed_by ON person_group_memberships(removed_by);
 		CREATE TABLE IF NOT EXISTS group_subgroups (
 			parent_group_id INTEGER NOT NULL,
 			child_group_id INTEGER NOT NULL,

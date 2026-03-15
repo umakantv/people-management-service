@@ -19,8 +19,14 @@ All endpoints require no authentication (AuthType: none). Group management endpo
   - [Create Group](#create-group)
   - [Update Group](#update-group)
   - [Add Member to Group](#add-member-to-group)
+  - [Remove Member from Group](#remove-member-from-group)
+  - [Bulk Manage Members](#bulk-manage-members)
   - [List Direct Members](#list-direct-members)
   - [Check Membership](#check-membership)
+  - [Add Subgroup to Group](#add-subgroup-to-group)
+  - [Remove Subgroup from Group](#remove-subgroup-from-group)
+- [Search API](#search-api)
+  - [Unified Search](#unified-search)
 
 ---
 
@@ -386,6 +392,163 @@ curl -s -X POST http://localhost:8080/groups/1/members \
 
 ---
 
+### Remove Member from Group
+
+**DELETE /groups/{id}/members/{personId}**
+
+Removes a person from the group. Only admin group members may remove others.
+
+**Restrictions:**
+- Requestor cannot remove themselves
+- Cannot remove another admin (even if you are an admin)
+
+```bash
+curl -s -X DELETE http://localhost:8080/groups/1/members/3 \
+  -H "X-Person-Id: 1"
+```
+
+**Response (200 OK):**
+
+```json
+{"status": "removed"}
+```
+
+**Errors:**
+
+- `400 Bad Request` – Missing/invalid `X-Person-Id`, invalid ID
+- `403 Forbidden` – Requestor not admin, trying to remove self, or trying to remove another admin
+- `404 Not Found` – Group or target person not found
+
+```bash
+# Non-admin tries to remove
+curl -s -X DELETE http://localhost:8080/groups/1/members/3 \
+  -H "X-Person-Id: 999"
+# -> 403: {"error": "requestor is not admin"}
+
+# Admin tries to remove themselves
+curl -s -X DELETE http://localhost:8080/groups/1/members/1 \
+  -H "X-Person-Id: 1"
+# -> 403: {"error": "cannot remove yourself from the group"}
+
+# Admin tries to remove another admin
+curl -s -X DELETE http://localhost:8080/groups/1/members/2 \
+  -H "X-Person-Id: 1"
+# -> 403: {"error": "cannot remove another admin from the group"}
+
+# Person not found
+curl -s -X DELETE http://localhost:8080/groups/1/members/999 \
+  -H "X-Person-Id: 1"
+# -> 404: {"error": "person not found"}
+```
+
+---
+
+### Bulk Manage Members
+
+**POST /groups/{id}/bulk-members**
+
+Bulk add or remove multiple members from a group in a single atomic operation.
+
+- **Atomic**: All operations succeed or none are applied (transaction-based)
+- **Idempotent**: Adding an existing member or removing a non-member returns success
+- **Maximum 100 person_ids per request**
+- Requires `X-Person-Id` header and admin access
+
+**Request Body:**
+
+```json
+{
+  "person_ids": [2, 3, 4],
+  "action": "add"  // or "remove"
+}
+```
+
+**Add Example:**
+
+```bash
+curl -s -X POST http://localhost:8080/groups/1/bulk-members \
+  -H "Content-Type: application/json" \
+  -H "X-Person-Id: 1" \
+  -d '{"person_ids": [2, 3, 4], "action": "add"}'
+```
+
+**Remove Example:**
+
+```bash
+curl -s -X POST http://localhost:8080/groups/1/bulk-members \
+  -H "Content-Type: application/json" \
+  -H "X-Person-Id: 1" \
+  -d '{"person_ids": [2, 3], "action": "remove"}'
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "total_requested": 3,
+  "total_success": 3,
+  "total_failed": 0,
+  "results": [
+    {"person_id": 2, "success": true},
+    {"person_id": 3, "success": true},
+    {"person_id": 4, "success": true}
+  ]
+}
+```
+
+**Partial Failure Response:**
+
+```json
+{
+  "total_requested": 3,
+  "total_success": 2,
+  "total_failed": 1,
+  "results": [
+    {"person_id": 2, "success": true},
+    {"person_id": 3, "success": false, "error": "failed to add member"},
+    {"person_id": 4, "success": true}
+  ]
+}
+```
+
+**Errors:**
+
+- `400 Bad Request` – Missing/invalid `X-Person-Id`, invalid JSON, empty `person_ids`, `action` not "add" or "remove", more than 100 person_ids
+- `403 Forbidden` – Requestor not admin
+- `404 Not Found` – Group not found or any person_id not found
+
+```bash
+# Empty array
+curl -s -X POST http://localhost:8080/groups/1/bulk-members \
+  -H "Content-Type: application/json" \
+  -H "X-Person-Id: 1" \
+  -d '{"person_ids": [], "action": "add"}'
+# -> 400: {"error": "person_ids array is required and cannot be empty"}
+
+# Too many IDs
+curl -s -X POST http://localhost:8080/groups/1/bulk-members \
+  -H "Content-Type: application/json" \
+  -H "X-Person-Id: 1" \
+  -d '{"person_ids": [1,2,3,...101], "action": "add"}'
+# -> 400: {"error": "maximum 100 person_ids allowed per request"}
+
+# Invalid action
+curl -s -X POST http://localhost:8080/groups/1/bulk-members \
+  -H "Content-Type: application/json" \
+  -H "X-Person-Id: 1" \
+  -d '{"person_ids": [2], "action": "delete"}'
+# -> 400: {"error": "action must be 'add' or 'remove'"}
+
+# Non-admin tries bulk operation
+curl -s -X POST http://localhost:8080/groups/1/bulk-members \
+  -H "Content-Type: application/json" \
+  -H "X-Person-Id: 999" \
+  -d '{"person_ids": [2, 3], "action": "add"}'
+# -> 403: {"error": "requestor is not admin"}
+```
+
+---
+
 ### List Direct Members
 
 **GET /groups/{id}/members/direct**
@@ -455,6 +618,182 @@ curl -s http://localhost:8080/groups/1/members/999/check
 # Invalid person ID
 curl -s http://localhost:8080/groups/1/members/abc/check
 ```
+
+---
+
+### Add Subgroup to Group
+
+**POST /groups/{id}/subgroups**
+
+Adds another group as a subgroup of the specified group. Requires `X-Person-Id` header and admin access.
+
+- Parent group must have `allow_sub_groups: true`
+- Requestor must be a member of the parent group's admin group (directly or via subgroups)
+- Cannot add a group as subgroup of itself
+- Cannot create circular references
+
+```bash
+curl -s -X POST http://localhost:8080/groups/1/subgroups \
+  -H "Content-Type: application/json" \
+  -H "X-Person-Id: 1" \
+  -d '{"subgroup_id": 5}'
+```
+
+**Response (201 Created):**
+
+```json
+{
+  "status": "added",
+  "parent_id": 1,
+  "subgroup_id": 5
+}
+```
+
+**Errors:**
+
+- `400 Bad Request` – Missing/invalid `X-Person-Id`, missing `subgroup_id`, invalid ID, self-reference, circular reference
+- `403 Forbidden` – Subgroups not allowed on parent group, or requestor not admin
+- `404 Not Found` – Parent group or subgroup not found
+
+```bash
+# Subgroups not allowed
+curl -s -X POST http://localhost:8080/groups/1/subgroups \
+  -H "Content-Type: application/json" \
+  -H "X-Person-Id: 1" \
+  -d '{"subgroup_id": 5}'
+# -> 403: {"error": "subgroups not allowed for this group"}
+
+# Non-admin tries to add
+curl -s -X POST http://localhost:8080/groups/1/subgroups \
+  -H "Content-Type: application/json" \
+  -H "X-Person-Id: 999" \
+  -d '{"subgroup_id": 5}'
+# -> 403: {"error": "requestor is not admin"}
+```
+
+---
+
+### Remove Subgroup from Group
+
+**DELETE /groups/{id}/subgroups/{subgroupId}**
+
+Removes a subgroup relationship. Requires `X-Person-Id` header and admin access to parent group.
+
+```bash
+curl -s -X DELETE http://localhost:8080/groups/1/subgroups/5 \
+  -H "X-Person-Id: 1"
+```
+
+**Response (200 OK):**
+
+```json
+{"status": "removed"}
+```
+
+**Errors:**
+
+- `400 Bad Request` – Missing/invalid `X-Person-Id`, invalid ID
+- `403 Forbidden` – Requestor not admin
+- `404 Not Found` – Parent group not found
+
+```bash
+# Non-admin tries to remove
+curl -s -X DELETE http://localhost:8080/groups/1/subgroups/5 \
+  -H "X-Person-Id: 999"
+# -> 403: {"error": "requestor is not admin"}
+```
+
+---
+
+## Search API
+
+### Unified Search
+
+**GET /search?q={query}**
+
+Performs full-text search across both people and groups, returning combined results.
+
+- **FTS5 powered**: When `USE_FTS=true` in .env, uses SQLite FTS5 for faster, more accurate results
+- **Automatic fallback**: Falls back to LIKE queries if FTS is unavailable
+- **Ranked results**: FTS results are ranked with exact matches prioritized
+- **No auth required**
+
+**Query Parameters:**
+
+| Parameter | Required | Description |
+|-----------|----------|-------------|
+| q | Yes | Search query string (max 200 chars) |
+
+**Example:**
+
+```bash
+curl -s "http://localhost:8080/search?q=alice"
+```
+
+**Response (200 OK):**
+
+```json
+{
+  "query": "alice",
+  "fts": true,
+  "people": [
+    {
+      "id": 1,
+      "name": "Alice Smith",
+      "email": "alice.smith@example.com",
+      "is_active": 1,
+      "joined_date": "2024-01-15"
+    }
+  ],
+  "groups": [
+    {
+      "id": 5,
+      "name": "Alice's Team",
+      "description": "Team led by Alice",
+      "allow_sub_groups": 0
+    }
+  ],
+  "total": 2
+}
+```
+
+**Advanced FTS Queries:**
+
+```bash
+# Phrase search (exact phrase)
+curl -s "http://localhost:8080/search?q=\"john doe\""
+
+# Prefix search (starts with)
+curl -s "http://localhost:8080/search?q=al*"
+
+# Boolean AND
+curl -s "http://localhost:8080/search?q=alice AND smith"
+
+# Boolean OR
+curl -s "http://localhost:8080/search?q=alice OR bob"
+
+# NEAR (words near each other)
+curl -s "http://localhost:8080/search?q=NEAR(alice team)"
+
+# Column-specific search (FTS only)
+# Search only in email column
+curl -s "http://localhost:8080/search?q=email:test"
+
+# Exclude terms
+curl -s "http://localhost:8080/search?q=alice NOT test"
+```
+
+**With FTS disabled (USE_FTS=false or not set):**
+
+```bash
+# Uses LIKE queries - simple substring matching
+curl -s "http://localhost:8080/search?q=ali"
+# Matches: "Alice", "Alice Smith", "ali@test.com", etc.
+```
+
+**Errors:**
+
+- `400 Bad Request` – Missing `q` parameter
 
 ---
 

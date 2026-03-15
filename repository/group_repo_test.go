@@ -270,3 +270,144 @@ func TestResolveGroupsForPerson_NotInAnyGroup(t *testing.T) {
 		t.Errorf("expected 0 groups for person not in any group, got %d", len(groups))
 	}
 }
+
+func TestGetMembershipReport_NoActivities(t *testing.T) {
+	groupRepo, _ := setupGroupTest(t)
+
+	report, err := groupRepo.GetMembershipReport()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(report) != 0 {
+		t.Errorf("expected 0 activities, got %d", len(report))
+	}
+}
+
+func TestGetMembershipReport_WithAdditions(t *testing.T) {
+	groupRepo, personRepo := setupGroupTest(t)
+
+	// Create people and group
+	p1, _ := personRepo.Create(models.CreatePersonRequest{Name: "Alice", Email: "a@test.com", JoinedDate: "2024-01-01"})
+	p2, _ := personRepo.Create(models.CreatePersonRequest{Name: "Bob", Email: "b@test.com", JoinedDate: "2024-01-01"})
+	group, _ := groupRepo.Create(models.CreateGroupRequest{Name: "TestGroup"})
+
+	// Add members
+	groupRepo.AddPersonToGroup(p1.ID, group.ID, p1.ID)
+	groupRepo.AddPersonToGroup(p2.ID, group.ID, p1.ID)
+
+	// Get report
+	report, err := groupRepo.GetMembershipReport()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should have activities for both people
+	if len(report) != 2 {
+		t.Errorf("expected 2 people in report, got %d", len(report))
+	}
+
+	// Check p1's activities
+	if activities, ok := report[p1.ID]; ok {
+		found := false
+		for _, act := range activities {
+			if act.ActivityType == "added" && act.GroupID == group.ID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("expected p1 to have 'added' activity for group")
+		}
+	} else {
+		t.Errorf("expected p1 to be in report")
+	}
+}
+
+func TestGetMembershipReport_WithRemovals(t *testing.T) {
+	groupRepo, personRepo := setupGroupTest(t)
+
+	// Create people and group
+	p1, _ := personRepo.Create(models.CreatePersonRequest{Name: "Alice", Email: "a@test.com", JoinedDate: "2024-01-01"})
+	group, _ := groupRepo.Create(models.CreateGroupRequest{Name: "TestGroup"})
+
+	// Add and then remove member
+	groupRepo.AddPersonToGroup(p1.ID, group.ID, p1.ID)
+	groupRepo.RemovePersonFromGroup(p1.ID, group.ID, p1.ID)
+
+	// Get report
+	report, err := groupRepo.GetMembershipReport()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Should have activities for p1
+	if activities, ok := report[p1.ID]; ok {
+		if len(activities) != 2 {
+			t.Errorf("expected 2 activities (add and remove), got %d", len(activities))
+		}
+
+		// Check for both added and removed activities
+		foundAdded := false
+		foundRemoved := false
+		for _, act := range activities {
+			if act.ActivityType == "added" {
+				foundAdded = true
+			}
+			if act.ActivityType == "removed" {
+				foundRemoved = true
+			}
+		}
+		if !foundAdded {
+			t.Errorf("expected 'added' activity")
+		}
+		if !foundRemoved {
+			t.Errorf("expected 'removed' activity")
+		}
+	} else {
+		t.Errorf("expected p1 to be in report")
+	}
+}
+
+func TestSoftDelete_RemovesFromActiveMembership(t *testing.T) {
+	groupRepo, personRepo := setupGroupTest(t)
+
+	// Create person and group
+	p1, _ := personRepo.Create(models.CreatePersonRequest{Name: "Alice", Email: "a@test.com", JoinedDate: "2024-01-01"})
+	group, _ := groupRepo.Create(models.CreateGroupRequest{Name: "TestGroup"})
+
+	// Add member
+	groupRepo.AddPersonToGroup(p1.ID, group.ID, p1.ID)
+
+	// Verify member is in group
+	isMember, _ := groupRepo.IsPersonDirectMember(p1.ID, group.ID)
+	if !isMember {
+		t.Fatalf("person should be member before removal")
+	}
+
+	// Remove member (soft delete)
+	groupRepo.RemovePersonFromGroup(p1.ID, group.ID, p1.ID)
+
+	// Verify member is NOT in group anymore
+	isMember, _ = groupRepo.IsPersonDirectMember(p1.ID, group.ID)
+	if isMember {
+		t.Errorf("person should NOT be member after soft delete")
+	}
+
+	// Verify member appears in report with removal activity
+	report, _ := groupRepo.GetMembershipReport()
+	if activities, ok := report[p1.ID]; ok {
+		foundRemoved := false
+		for _, act := range activities {
+			if act.ActivityType == "removed" {
+				foundRemoved = true
+				break
+			}
+		}
+		if !foundRemoved {
+			t.Errorf("expected 'removed' activity in report")
+		}
+	} else {
+		t.Errorf("expected p1 to be in report")
+	}
+}

@@ -2,6 +2,7 @@ package repository
 
 import (
 	"database/sql"
+	"strings"
 
 	"github.com/jmoiron/sqlx"
 
@@ -134,15 +135,178 @@ func (r *GroupRepository) Delete(id int) error {
 
 // AddPersonToGroup adds a person as member of a group, tracking who added them
 func (r *GroupRepository) AddPersonToGroup(personID, groupID, addedBy int) error {
-	query := `INSERT OR IGNORE INTO person_group_memberships (person_id, group_id, added_by) VALUES (?, ?, ?)`
+	query := `INSERT OR IGNORE INTO person_group_memberships (person_id, group_id, added_by, added_at) VALUES (?, ?, ?, datetime('now'))`
 	_, err := r.db.Exec(query, personID, groupID, addedBy)
 	return err
 }
 
-// RemovePersonFromGroup removes a person from a group
-func (r *GroupRepository) RemovePersonFromGroup(personID, groupID int) error {
+// RemovePersonFromGroup soft-deletes a person from a group by setting removed_at and removed_by
+func (r *GroupRepository) RemovePersonFromGroup(personID, groupID, removedBy int) error {
+	query := `UPDATE person_group_memberships SET removed_at = datetime('now'), removed_by = ? WHERE person_id = ? AND group_id = ? AND removed_at IS NULL`
+	_, err := r.db.Exec(query, removedBy, personID, groupID)
+	return err
+}
+
+// HardRemovePersonFromGroup permanently deletes a person from a group (use with caution)
+func (r *GroupRepository) HardRemovePersonFromGroup(personID, groupID int) error {
 	_, err := r.db.Exec("DELETE FROM person_group_memberships WHERE person_id = ? AND group_id = ?", personID, groupID)
 	return err
+}
+
+// BulkOperationResult represents the result of a single bulk operation
+type BulkOperationResult struct {
+	PersonID int    `json:"person_id"`
+	Success  bool   `json:"success"`
+	Error    string `json:"error,omitempty"`
+}
+
+// BulkMembersRequest represents a bulk add/remove request
+type BulkMembersRequest struct {
+	PersonIDs []int  `json:"person_ids"`
+	Action    string `json:"action"` // "add" or "remove"
+}
+
+// BulkMembersResponse represents the response from a bulk operation
+type BulkMembersResponse struct {
+	TotalRequested int                   `json:"total_requested"`
+	TotalSuccess   int                   `json:"total_success"`
+	TotalFailed    int                   `json:"total_failed"`
+	Results        []BulkOperationResult `json:"results"`
+}
+
+// BulkAddMembersToGroup atomically adds multiple members to a group
+func (r *GroupRepository) BulkAddMembersToGroup(personIDs []int, groupID, addedBy int) (*BulkMembersResponse, error) {
+	response := &BulkMembersResponse{
+		TotalRequested: len(personIDs),
+		Results:        make([]BulkOperationResult, 0, len(personIDs)),
+	}
+
+	// Start a transaction
+	tx, err := r.db.Beginx()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	for _, personID := range personIDs {
+		result := BulkOperationResult{PersonID: personID}
+
+		// Check if already a member (and not removed)
+		var count int
+		err := tx.Get(&count, "SELECT COUNT(1) FROM person_group_memberships WHERE person_id = ? AND group_id = ? AND removed_at IS NULL", personID, groupID)
+		if err != nil {
+			result.Success = false
+			result.Error = "failed to check existing membership"
+			response.Results = append(response.Results, result)
+			response.TotalFailed++
+			continue
+		}
+
+		if count > 0 {
+			// Already a member - treat as success (idempotent)
+			result.Success = true
+			response.Results = append(response.Results, result)
+			response.TotalSuccess++
+			continue
+		}
+
+		// Check if was previously removed (re-adding)
+		var removedCount int
+		err = tx.Get(&removedCount, "SELECT COUNT(1) FROM person_group_memberships WHERE person_id = ? AND group_id = ? AND removed_at IS NOT NULL", personID, groupID)
+		if err != nil {
+			result.Success = false
+			result.Error = "failed to check previous membership"
+			response.Results = append(response.Results, result)
+			response.TotalFailed++
+			continue
+		}
+
+		if removedCount > 0 {
+			// Re-activate by clearing removed_at and removed_by, update added_by
+			_, err = tx.Exec("UPDATE person_group_memberships SET removed_at = NULL, removed_by = NULL, added_by = ?, added_at = datetime('now') WHERE person_id = ? AND group_id = ?", addedBy, personID, groupID)
+		} else {
+			// New insertion
+			_, err = tx.Exec("INSERT INTO person_group_memberships (person_id, group_id, added_by, added_at) VALUES (?, ?, ?, datetime('now'))", personID, groupID, addedBy)
+		}
+
+		if err != nil {
+			result.Success = false
+			result.Error = "failed to add member"
+			response.Results = append(response.Results, result)
+			response.TotalFailed++
+			continue
+		}
+
+		result.Success = true
+		response.Results = append(response.Results, result)
+		response.TotalSuccess++
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	return response, nil
+}
+
+// BulkRemoveMembersFromGroup atomically removes multiple members from a group
+func (r *GroupRepository) BulkRemoveMembersFromGroup(personIDs []int, groupID, removedBy int) (*BulkMembersResponse, error) {
+	response := &BulkMembersResponse{
+		TotalRequested: len(personIDs),
+		Results:        make([]BulkOperationResult, 0, len(personIDs)),
+	}
+
+	// Start a transaction
+	tx, err := r.db.Beginx()
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+
+	for _, personID := range personIDs {
+		result := BulkOperationResult{PersonID: personID}
+
+		// Check if actually a member
+		var count int
+		err := tx.Get(&count, "SELECT COUNT(1) FROM person_group_memberships WHERE person_id = ? AND group_id = ? AND removed_at IS NULL", personID, groupID)
+		if err != nil {
+			result.Success = false
+			result.Error = "failed to check membership"
+			response.Results = append(response.Results, result)
+			response.TotalFailed++
+			continue
+		}
+
+		if count == 0 {
+			// Not a member - treat as success (idempotent)
+			result.Success = true
+			response.Results = append(response.Results, result)
+			response.TotalSuccess++
+			continue
+		}
+
+		// Perform soft delete
+		_, err = tx.Exec("UPDATE person_group_memberships SET removed_at = datetime('now'), removed_by = ? WHERE person_id = ? AND group_id = ? AND removed_at IS NULL", removedBy, personID, groupID)
+		if err != nil {
+			result.Success = false
+			result.Error = "failed to remove member"
+			response.Results = append(response.Results, result)
+			response.TotalFailed++
+			continue
+		}
+
+		result.Success = true
+		response.Results = append(response.Results, result)
+		response.TotalSuccess++
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+
+	return response, nil
 }
 
 // AddSubgroup adds a group as subgroup of another group
@@ -158,10 +322,10 @@ func (r *GroupRepository) RemoveSubgroup(parentGroupID, childGroupID int) error 
 	return err
 }
 
-// GetDirectPersonMembers returns person IDs directly in a group
+// GetDirectPersonMembers returns person IDs directly in a group (excluding removed)
 func (r *GroupRepository) GetDirectPersonMembers(groupID int) ([]int, error) {
 	var ids []int
-	query := `SELECT person_id FROM person_group_memberships WHERE group_id = ?`
+	query := `SELECT person_id FROM person_group_memberships WHERE group_id = ? AND removed_at IS NULL`
 	err := r.db.Select(&ids, query, groupID)
 	if err != nil {
 		return nil, err
@@ -184,10 +348,10 @@ func (r *GroupRepository) GetDirectPeopleAndSubgroups(groupID int) ([]int, []int
 	return people, groups, nil
 }
 
-// IsPersonDirectMember checks if person is directly a member of a group
+// IsPersonDirectMember checks if person is directly a member of a group (and not removed)
 func (r *GroupRepository) IsPersonDirectMember(personID, groupID int) (bool, error) {
 	var count int
-	query := `SELECT COUNT(1) FROM person_group_memberships WHERE person_id = ? AND group_id = ?`
+	query := `SELECT COUNT(1) FROM person_group_memberships WHERE person_id = ? AND group_id = ? AND removed_at IS NULL`
 	if err := r.db.Get(&count, query, personID, groupID); err != nil {
 		return false, err
 	}
@@ -225,10 +389,10 @@ func (r *GroupRepository) GetDirectSubgroups(groupID int) ([]int, error) {
 	return ids, nil
 }
 
-// GetGroupsForPerson returns group IDs the person is directly in
+// GetGroupsForPerson returns group IDs the person is directly in (excluding removed)
 func (r *GroupRepository) GetGroupsForPerson(personID int) ([]int, error) {
 	var ids []int
-	query := `SELECT group_id FROM person_group_memberships WHERE person_id = ?`
+	query := `SELECT group_id FROM person_group_memberships WHERE person_id = ? AND removed_at IS NULL`
 	err := r.db.Select(&ids, query, personID)
 	if err != nil {
 		return nil, err
@@ -333,4 +497,147 @@ func boolToInt(b bool) int {
 // Helper: check if row exists
 func rowExists(err error) bool {
 	return err != sql.ErrNoRows && err != nil
+}
+
+// Search finds groups by substring match on name or description (LIKE fallback)
+func (r *GroupRepository) Search(query string) ([]models.Group, error) {
+	var groups []models.Group
+	searchPattern := "%" + strings.ToLower(query) + "%"
+	sqlQuery := `
+		SELECT id, name, description, members_visible, allow_self_add, allow_sub_groups, admin_group_id
+		FROM groups
+		WHERE LOWER(name) LIKE ? OR LOWER(description) LIKE ?
+		ORDER BY id
+	`
+	err := r.db.Select(&groups, sqlQuery, searchPattern, searchPattern)
+	if err != nil {
+		return nil, err
+	}
+	return groups, nil
+}
+
+// SearchFTS searches groups using FTS5 for faster, more accurate results
+func (r *GroupRepository) SearchFTS(query string) ([]models.Group, error) {
+	var groups []models.Group
+	sqlQuery := `
+		SELECT g.id, g.name, g.description, g.members_visible, g.allow_self_add, g.allow_sub_groups, g.admin_group_id
+		FROM groups g
+		JOIN groups_fts ON g.id = groups_fts.rowid
+		WHERE groups_fts MATCH ?
+		ORDER BY bm25(groups_fts, 1.0, 0.5)
+		LIMIT 50
+	`
+	err := r.db.Select(&groups, sqlQuery, query)
+	if err != nil {
+		return nil, err
+	}
+	return groups, nil
+}
+
+// SearchWithFallback tries FTS search first, falls back to LIKE if FTS unavailable
+func (r *GroupRepository) SearchWithFallback(query string, useFTS bool) ([]models.Group, error) {
+	if useFTS {
+		groups, err := r.SearchFTS(query)
+		if err == nil && len(groups) > 0 {
+			return groups, nil
+		}
+	}
+	return r.Search(query)
+}
+
+// SearchResult represents a unified search result for the combined endpoint
+type SearchResult struct {
+	People []models.Person `json:"people"`
+	Groups []models.Group  `json:"groups"`
+}
+
+// SearchAll performs unified search across people and groups
+func (r *GroupRepository) SearchAll(query string, personRepo *PersonRepository, useFTS bool) (*SearchResult, error) {
+	people, err := personRepo.SearchWithFallback(query, useFTS)
+	if err != nil {
+		people = []models.Person{}
+	}
+
+	groups, err := r.SearchWithFallback(query, useFTS)
+	if err != nil {
+		groups = []models.Group{}
+	}
+
+	return &SearchResult{
+		People: people,
+		Groups: groups,
+	}, nil
+}
+
+// MembershipActivity represents a single membership change (addition or removal)
+type MembershipActivity struct {
+	PersonID   int        `db:"person_id" json:"person_id"`
+	GroupID    int        `db:"group_id" json:"group_id"`
+	AddedBy    *int       `db:"added_by" json:"added_by,omitempty"`
+	AddedAt    *string    `db:"added_at" json:"added_at,omitempty"`
+	RemovedAt  *string    `db:"removed_at" json:"removed_at,omitempty"`
+	ActivityType string   `json:"activity_type"` // "added" or "removed"
+}
+
+// GetMembershipActivitiesFromPastDay returns all membership additions and removals from the past 24 hours
+// Results are grouped by person_id in a map
+func (r *GroupRepository) GetMembershipActivitiesFromPastDay() (map[int][]MembershipActivity, error) {
+	// Get all additions from past day
+	query := `
+		SELECT person_id, group_id, added_by, added_at,
+			CASE WHEN removed_at IS NULL THEN NULL ELSE removed_at END as removed_at
+		FROM person_group_memberships
+		WHERE (added_at >= datetime('now', '-1 day'))
+		   OR (removed_at >= datetime('now', '-1 day'))
+		ORDER BY person_id, added_at, removed_at
+	`
+
+	var rows []struct {
+		PersonID  int     `db:"person_id"`
+		GroupID   int     `db:"group_id"`
+		AddedBy   *int    `db:"added_by"`
+		AddedAt   *string `db:"added_at"`
+		RemovedAt *string `db:"removed_at"`
+	}
+
+	err := r.db.Select(&rows, query)
+	if err != nil {
+		return nil, err
+	}
+
+	// Group by person_id
+	activitiesByPerson := make(map[int][]MembershipActivity)
+
+	for _, row := range rows {
+		// Check if this is a new addition (added in past day)
+		if row.AddedAt != nil {
+			activity := MembershipActivity{
+				PersonID:     row.PersonID,
+				GroupID:      row.GroupID,
+				AddedBy:      row.AddedBy,
+				AddedAt:      row.AddedAt,
+				ActivityType: "added",
+			}
+			activitiesByPerson[row.PersonID] = append(activitiesByPerson[row.PersonID], activity)
+		}
+
+		// Check if this is a removal (removed in past day)
+		if row.RemovedAt != nil {
+			activity := MembershipActivity{
+				PersonID:     row.PersonID,
+				GroupID:      row.GroupID,
+				RemovedAt:    row.RemovedAt,
+				ActivityType: "removed",
+			}
+			activitiesByPerson[row.PersonID] = append(activitiesByPerson[row.PersonID], activity)
+		}
+	}
+
+	return activitiesByPerson, nil
+}
+
+// GetMembershipReport generates a report of all membership changes in the past day
+// Returns a map of person_id to their list of activities
+func (r *GroupRepository) GetMembershipReport() (map[int][]MembershipActivity, error) {
+	return r.GetMembershipActivitiesFromPastDay()
 }

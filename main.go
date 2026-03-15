@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -132,6 +133,72 @@ func main() {
 		Path:     "/groups/{id}/members/{personId}/check",
 		AuthType: "none",
 	}, httpserver.HandlerFunc(groupHandler.IsMember))
+
+	server.Register(httpserver.Route{
+		Name:     "AddGroupSubgroup",
+		Method:   "POST",
+		Path:     "/groups/{id}/subgroups",
+		AuthType: "none",
+	}, httpserver.HandlerFunc(groupHandler.AddSubgroup))
+
+	server.Register(httpserver.Route{
+		Name:     "RemoveGroupSubgroup",
+		Method:   "DELETE",
+		Path:     "/groups/{id}/subgroups/{subgroupId}",
+		AuthType: "none",
+	}, httpserver.HandlerFunc(groupHandler.RemoveSubgroup))
+
+	server.Register(httpserver.Route{
+		Name:     "RemoveGroupMember",
+		Method:   "DELETE",
+		Path:     "/groups/{id}/members/{personId}",
+		AuthType: "none",
+	}, httpserver.HandlerFunc(groupHandler.RemoveMember))
+
+	server.Register(httpserver.Route{
+		Name:     "BulkGroupMembers",
+		Method:   "POST",
+		Path:     "/groups/{id}/bulk-members",
+		AuthType: "none",
+	}, httpserver.HandlerFunc(groupHandler.BulkMembers))
+
+	// Create search handler with access to both repos and config
+	searchHandler := func(ctx context.Context, w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("q")
+		if query == "" {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]string{"error": "query parameter 'q' is required"})
+			return
+		}
+
+		// Sanitize query - limit length
+		if len(query) > 200 {
+			query = query[:200]
+		}
+
+		result, err := groupRepo.SearchAll(query, personRepo, cfg.UseFTS)
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": "search failed"})
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"query":  query,
+			"fts":    cfg.UseFTS,
+			"people": result.People,
+			"groups": result.Groups,
+			"total":  len(result.People) + len(result.Groups),
+		})
+	}
+
+	server.Register(httpserver.Route{
+		Name:     "UnifiedSearch",
+		Method:   "GET",
+		Path:     "/search",
+		AuthType: "none",
+	}, httpserver.HandlerFunc(searchHandler))
 
 	logger.Info("Starting people service on port 8080")
 	if err := server.Start(); err != nil {
